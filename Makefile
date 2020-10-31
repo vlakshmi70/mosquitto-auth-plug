@@ -92,6 +92,7 @@ ifneq ($(BACKEND_JWT), no)
 	BACKENDS+= -DBE_JWT
 	BACKENDSTR += JWT
 
+	BE_CFLAGS += -I/tmp/mosquitto-src/lib/
 	BE_LDADD += -lcurl
 	OBJS += be-jwt.o
 endif
