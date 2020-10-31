@@ -43,63 +43,28 @@
 #include <uthash.h>
 #include <time.h>
 
+/* data structure for storing a user's allowed topic and role */
+typedef struct AuthInfo_t {
+	char *topic;
+	char *role;
+	long exp_time;
+} auth_info_t;
 
-/*
- * user authentication info data types 
- */
-#define MAX_USERNAME_LEN 60
-#define MAX_TOPIC_LEN 60
-#define MAX_ROLE_LEN 50
-typedef struct User_Info_t {
-        char username[MAX_USERNAME_LEN];
-        char topic[MAX_TOPIC_LEN];
-	char role[MAX_ROLE_LEN];
-        long exp_time;
+typedef struct UserInfo_t {
+	char *username;
+	auth_info_t *auth_info;
+	UT_hash_handle hh;
 } user_info_t;
 
-typedef struct User_List_t {
-        struct User_List_t *next;
-        user_info_t *user;
-} user_list_t;
+/* global variable for storing a user's allowed role and topic */
+user_info_t *user_info_list=NULL;
 
-/* 
- * global variable for user info list
- */
-user_list_t *head;
-
-#define ERR_USER_NOT_FOUND -1
-#define ERR_MEM_FAILURE -2
-#define SUCCESS_USER 1
-void init_user_list();
-int add_user_info(user_info_t *user);
+void add_user_info(char *username, char *topic, char *role, long exp_time);
 user_info_t *get_user_info(char *username);
-int del_user_info(char *username);
+void del_user_info(char *username);
 void del_user_list();
-void print_user(user_info_t *user);
-void print_user_list();
 
-/*
- * User Role to access mapping data type
- */
-typedef struct RoleAccessMap_t {
-	char role[MAX_ROLE_LEN];
-	int access;
-} role_access_t;
-
-/* 
- * global variable for role to access mapping
- */
-#define MAX_ROLES 25
-role_access_t role_access_map[MAX_ROLES];
-
-void init_role_access_map(const char *required_env);
-int get_access_from_role(char *role);
-#define MAX_BITS 4
-int check_access(const char *username, const char *reqTopic, int reqAccess, char *allowedTopic, int allowedAccess);
-int user_role_check (int request, int allowed);
-
-
-static int http_post(void *handle, char *uri, const char *username, const char *password, const char *topic, int acc, int method);
+static int my_http_post(void *handle, char *uri, const char *username, const char *password, const char *topic, int acc, int method);
 
 static int get_string_envs(CURL *curl, const char *required_env, char *querystring)
 {
@@ -163,6 +128,143 @@ static int get_string_envs(CURL *curl, const char *required_env, char *querystri
 	return (num);
 }
 
+static int http_post(void *handle, char *uri, const char *clientid, const char *token, const char *topic, int acc, int method)
+{
+	struct jwt_backend *conf = (struct jwt_backend *)handle;
+	CURL *curl;
+	struct curl_slist *headerlist = NULL;
+	int re;
+	int respCode = 0;
+	int ok = BACKEND_DEFER;
+	char url[BUFSIZ];
+	char *data;
+
+	
+
+	if (token == NULL)
+	{
+		return BACKEND_DEFER;
+	}
+	clientid = (clientid && *clientid) ? clientid : "";
+	topic = (topic && *topic) ? topic : "";
+
+	if ((curl = curl_easy_init()) == NULL)
+	{
+		_fatal("create curl_easy_handle fails");
+		return BACKEND_ERROR;
+	}
+	if (conf->hostheader != NULL)
+		headerlist = curl_slist_append(headerlist, conf->hostheader);
+	headerlist = curl_slist_append(headerlist, "Expect:");
+
+	//_log(LOG_NOTICE, "u=%s p=%s t=%s acc=%d", username, password, topic, acc);
+
+	// uri begins with a slash
+	snprintf(url, sizeof(url), "%s://%s:%d%s",
+			 strcmp(conf->with_tls, "true") == 0 ? "https" : "http",
+			 conf->hostname ? conf->hostname : conf->ip,
+			 conf->port,
+			 uri);
+
+	char *escaped_token = curl_easy_escape(curl, token, 0);
+	char *escaped_topic = curl_easy_escape(curl, topic, 0);
+	char *escaped_clientid = curl_easy_escape(curl, clientid, 0);
+
+	char string_acc[20];
+	snprintf(string_acc, 20, "%d", acc);
+
+	char *string_envs = (char *)malloc(MAXPARAMSLEN);
+	if (string_envs == NULL)
+	{
+		_fatal("ENOMEM");
+		return BACKEND_ERROR;
+	}
+	memset(string_envs, 0, MAXPARAMSLEN);
+
+	//get the sys_env from here
+	int env_num = 0;
+	if (method == METHOD_GETUSER && conf->getuser_envs != NULL)
+	{
+		env_num = get_string_envs(curl, conf->getuser_envs, string_envs);
+	}
+	else if (method == METHOD_SUPERUSER && conf->superuser_envs != NULL)
+	{
+		env_num = get_string_envs(curl, conf->superuser_envs, string_envs);
+	}
+	else if (method == METHOD_ACLCHECK && conf->aclcheck_envs != NULL)
+	{
+		env_num = get_string_envs(curl, conf->aclcheck_envs, string_envs);
+	}
+	if (env_num == -1)
+	{
+		return BACKEND_ERROR;
+	}
+	//----over-- --
+
+	data = (char *)malloc(strlen(string_envs) + strlen(escaped_topic) + strlen(string_acc) + strlen(escaped_clientid) + 30);
+	if (data == NULL)
+	{
+		_fatal("ENOMEM");
+		return BACKEND_ERROR;
+	}
+	sprintf(data, "%stopic=%s&acc=%s&clientid=%s",
+			string_envs,
+			escaped_topic,
+			string_acc,
+			clientid);
+
+	_log(LOG_DEBUG, "url=%s", url);
+	_log(LOG_DEBUG, "data=%s", data);
+	//curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+	char *token_header = (char *)malloc(strlen(escaped_token) + strlen("Authorization: Bearer ") + 1);
+	if (token_header == NULL)
+	{
+		_fatal("ENOMEM");
+		return BACKEND_ERROR;
+	}
+	sprintf(token_header, "Authorization: Bearer %s", escaped_token);
+	headerlist = curl_slist_append(headerlist, token_header);
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerlist);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10);
+
+	re = curl_easy_perform(curl);
+	if (re == CURLE_OK)
+	{
+		re = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &respCode);
+		if (re == CURLE_OK && respCode >= 200 && respCode < 300)
+		{
+			ok = BACKEND_ALLOW;
+		}
+		else if (re == CURLE_OK && respCode >= 500)
+		{
+			ok = BACKEND_ERROR;
+		}
+		else
+		{
+			//_log(LOG_NOTICE, "http auth fail re=%d respCode=%d", re, respCode);
+		}
+	}
+	else
+	{
+		_log(LOG_DEBUG, "http req fail url=%s re=%s", url, curl_easy_strerror(re));
+		ok = BACKEND_ERROR;
+	}
+
+	curl_easy_cleanup(curl);
+	curl_slist_free_all(headerlist);
+	free(data);
+	free(string_envs);
+	free(escaped_token);
+	free(token_header);
+	free(escaped_topic);
+	free(escaped_clientid);
+	return (ok);
+}
 
 void *be_jwt_init()
 {
@@ -233,11 +335,8 @@ void *be_jwt_init()
 	_log(LOG_DEBUG, "superuser_params=%s", conf->superuser_envs);
 	_log(LOG_DEBUG, "aclcheck_params=%s", conf->aclcheck_envs);
 
-	init_user_list();
-	init_role_access_map(conf->aclcheck_envs);
 	return (conf);
 };
-
 void be_jwt_destroy(void *handle)
 {
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
@@ -260,114 +359,42 @@ int be_jwt_getuser(void *handle, const char *username, const char *pass, char **
 	int re;
 	if (username == NULL)
 	{
-		return BACKEND_ERROR;
+		return BACKEND_DENY;
 	}
-	printf("client-id = %s\n", clientid);
-	re = http_post(handle, conf->getuser_uri, username, pass, NULL, -1, METHOD_GETUSER);
+	if (clientid != NULL)
+		printf("client-id = %s\n", clientid);
+	re = my_http_post(handle, conf->getuser_uri, username, pass, NULL, -1, METHOD_GETUSER);
 	return re;
 };
 
-int be_jwt_superuser(void *handle, const char *username)
+int be_jwt_superuser(void *handle, const char *token)
 {
-	//struct jwt_backend *conf = (struct jwt_backend *)handle;
-	//int re;
+	struct jwt_backend *conf = (struct jwt_backend *)handle;
 
-	//re = http_post(handle, conf->superuser_uri, username, NULL, NULL, -1, METHOD_SUPERUSER);
-	/*
-	 * superuser not supported
-	 */
-	return BACKEND_ERROR;
+	return http_post(handle, conf->superuser_uri, NULL, token, NULL, -1, METHOD_SUPERUSER);
 };
 
 int be_jwt_aclcheck(void *handle, const char *clientid, const char *username, const char *topic, int acc)
 {
+	//struct jwt_backend *conf = (struct jwt_backend *)handle;
+	//struct jwt_backend *conf = (struct jwt_backend *)handle;
+	//return http_post(conf, conf->aclcheck_uri, clientid, token, topic, acc, METHOD_ACLCHECK);
 	user_info_t *pUser;
-	int allowedAccess=0;
-	int result=BACKEND_ERROR;
 
-	_log(LOG_DEBUG, "aclcheck: username = %s, requested topic = %s, requested access = %x", username, topic, acc);
+	printf("username = %s, input topic = %s, access requested = %d\n", username, topic, acc);
 	pUser = get_user_info((char *)username);
 	if (pUser) {
-		allowedAccess = get_access_from_role(pUser->role);
-		result = check_access(username, topic, acc, pUser->topic, allowedAccess);
-		if (result != BACKEND_ALLOW) {
-			del_user_info((char *)username);
-		}
-		return result;
+		_log(LOG_NOTICE, "username = <%s>, allowed topic=%s, allowed role=%s, token-expiry=%ld",username, pUser->auth_info->topic, pUser->auth_info->role,pUser->auth_info->exp_time);
+		return BACKEND_ALLOW;
 	}
-	return result;
+	return BACKEND_DENY;
 };
 
 /*
- * check requested topic/access against allowed topic/access
- * returns BACKEND_ALLOW or DENY
+ * get_access_from_role
  */
-int check_access(const char *username, const char *reqTopic, int reqAccess, char *allowedTopic, int allowedAccess)
-{
-
-	int result=BACKEND_ALLOW;
-
-	_log(LOG_DEBUG, "username = %s, requested topic = %s, requested access = %x, allowed topic = %s, allowed access = %x", username, reqTopic, reqAccess, allowedTopic, allowedAccess);
-	if (allowedAccess <= 0) {
-		_log(LOG_NOTICE, "<%s>: Access Denied, request-access=%d, allowedAccess=%d", username, reqAccess, allowedAccess);
-		result = BACKEND_ERROR;
-	}
-	else {
-		if (!strncmp("#", allowedTopic, 1)) {
-			result = user_role_check(reqAccess, allowedAccess);
-		}
-		else {
-			if (reqTopic) {
-				if (!strncmp(allowedTopic, reqTopic, strlen(allowedTopic))) {
-					result = user_role_check(reqAccess, allowedAccess);
-				}
-				else {
-					_log(LOG_NOTICE, "<%s>: Access Denied, Topic Not allowed", username);
-					result = BACKEND_ERROR;
-				}
-			}
-			else {
-				_log(LOG_NOTICE, "<%s>: Access deferred, Topic not specified", username);
-				result = BACKEND_DEFER;	
-			}
-		}
-	}
-	return result;
-}
-
-/*
- * check if user role is allowed access
- */
-int user_role_check (int request, int allowed) 
-{
-	int ok = BACKEND_ERROR;
-	switch (request) {
-		case 1:
-			if (allowed >= request)
-				ok=BACKEND_ALLOW;
-			break;
-		case 2:
-			if (allowed & request)
-				ok=BACKEND_ALLOW;
-			break;
-		case 3:
-			if (allowed & request)
-				ok=BACKEND_ALLOW;
-			break;
-		case 4:
-			ok=BACKEND_ALLOW;
-			break;
-	}
-	if (ok==BACKEND_ALLOW)
-		_log(LOG_DEBUG, "user_role_check: request-access=%d, allowed-access=%d, Access Granted", request, allowed);
-	else if (ok == BACKEND_ERROR)
-		_log(LOG_DEBUG, "user_role_check: request-access=%d, allowed-access=%d, Access Denied", request, allowed);
-	return ok;
-}
-/*
- * role access map - manipulation - init, get
- */
-void init_role_access_map(const char *required_env)
+#if 0
+static int get_acl_envs(const char *required_env, char *querystring)
 {
 	char *env_string = NULL;
 
@@ -376,155 +403,113 @@ void init_role_access_map(const char *required_env)
 	char *env_value[MAXPARAMSNUM];
 	int i, num = 0;
 
+	//_log(LOG_DEBUG, "sys_envs=%s", sys_envs);
+
 	env_string = (char *)malloc(strlen(required_env) + 20);
 	if (env_string == NULL)
 	{
 		_fatal("ENOMEM");
-		return;
+		return (-1);
 	}
 	sprintf(env_string, "%s", required_env);
 
+	//_log(LOG_DEBUG, "env_string=%s", env_string);
+
 	num = get_sys_envs(env_string, ",", "=", params_key, env_names, env_value);
+	//sprintf(querystring, "");
 	for (i = 0; i < num; i++)
 	{
-		_log(LOG_DEBUG, "role=%s, value=%d", params_key[i], atoi(env_names[i]));
-		sprintf(role_access_map[i].role,"%s", params_key[i]);
-		role_access_map[i].access = atoi(env_names[i]);
+		printf("role=%s, value=%s\n", params_key[i], env_names[i]);
 
 	}
+	return (num);
 }
+#endif
 int get_access_from_role(char *role) 
 {
-	for (int i=0;i<MAX_ROLES;i++) {
-		if (!strcmp(role, role_access_map[i].role)) {
-			return role_access_map[i].access;
-		}
+	if (!strcmp(role, "engineer")) {
+		return 2;
 	}
-	return -1;
+	else if (!strcmp(role, "guest")) {
+		return 1;
+	}
+	else if (!strcmp(role, "readonly")) {
+		return 1;
+	}
+	else return -1;
 }
 
 /*
- * user info manipulation - init, add, del, print
+ * add_user_info - takes user info and creates an entry in user_info_list for that user 
+ * user_info_list is used by aclcheck for determining whether a user is allowed to pub/sub to a topic
  */
-void init_user_list()
+void add_user_info(char *username, char *topic, char *role, long exp_time)
 {
-	head = NULL;
-}
-int add_user_info(user_info_t *user)
-{
-        user_list_t *p;
 	user_info_t *pUser;
 
-        if (user) {
-		_log(LOG_DEBUG, "add_user_info called with <%s>:Allowed topic=%s, Allowed Role=%s, exp_time=%ld\n", user->username, user->topic, user->role, user->exp_time);
-		pUser = get_user_info(user->username);
-		if (pUser) {
-                	_log(LOG_DEBUG, "User <%s> already exists, updating info ...\n", user->username);
-                	sprintf(pUser->username, "%s", user->username);
-                	sprintf(pUser->topic, "%s", user->topic);
-                	sprintf(pUser->role, "%s", user->role);
-                	pUser->exp_time = user->exp_time;
-		}
-		else {
-			_log(LOG_DEBUG, "Adding user: <%s>:Allowed topic=%s, Allowed Role=%s, exp_time=%ld\n", user->username, user->topic, user->role, user->exp_time);
-                	p = (user_list_t *) malloc(sizeof(user_list_t));
-                	if (!p) {
-                        	_log(LOG_DEBUG, "%s: add user failure, malloc error\n", user->username);
-                        	return ERR_MEM_FAILURE;
-                	}
-                	p->user=(user_info_t *)malloc(sizeof(user_info_t));
-                	if (!p->user) {
-                        	_log(LOG_DEBUG, "%s: add user failure, malloc error\n", user->username);
-                        	return ERR_MEM_FAILURE;
-                	}
-
-			memset(p->user, 0, sizeof(user_info_t));
-                	sprintf(p->user->username, "%s", user->username);
-                	sprintf(p->user->topic, "%s", user->topic);
-                	sprintf(p->user->role, "%s", user->role);
-                	p->user->exp_time = user->exp_time;
-                	p->next = NULL;
-                	if (!head) {
-                        	head = p;
-                	}
-                	else {
-				user_list_t *curr, *prev;
-				for (curr=head;curr;prev=curr, curr=curr->next);
-                        	prev->next = p;
-                	}
-		}
+        HASH_FIND_STR(user_info_list, username, pUser);
+        if (pUser) {
+                printf("%s already exists, updating info...\n", username);
         }
-        return SUCCESS_USER;
+	else {
+        	pUser = (user_info_t *)malloc(sizeof(user_info_t));
+        	pUser->auth_info = (auth_info_t *)malloc(sizeof(auth_info_t));
+        	pUser->username = (char *)malloc(strlen(username)+1);
+        	sprintf(pUser->username, "%s", username);
+        	pUser->auth_info->topic = (char *)malloc(strlen(topic)+1);
+        	pUser->auth_info->role = (char *)malloc(strlen(role)+1);
+	}
+        sprintf(pUser->auth_info->topic, "%s", topic);
+        sprintf(pUser->auth_info->role, "%s", role);
+	pUser->auth_info->exp_time = exp_time;
+        HASH_ADD_KEYPTR( hh, user_info_list, username, strlen(username),  pUser);
+
 }
+/*
+ * get_user_info - takes username and returns auth_info_t for that user
+ */
 user_info_t *get_user_info(char *username)
-{
-        user_list_t *p;
-        _log(LOG_DEBUG, "Searching user <%s> ...\n", username);
-        for (p=head; p; p=p->next) {
-                if (strncmp(p->user->username, username, strlen(username))) {
-                        _log(LOG_DEBUG, "User <%s> not matching, checking next ...\n", username);
-                        continue;
-                }
-                else {
-                        _log(LOG_DEBUG, "User <%s> found\n", username);
-                        return p->user;
-                }
+{ 
+	user_info_t *pUser;
 
-        }
-        _log(LOG_DEBUG, "User <%s> not found...\n", username);
-        return NULL;
+        HASH_FIND_STR( user_info_list, username, pUser );
+        if (pUser)
+                return pUser;
+        else
+                return NULL;
 }
-int del_user_info(char *username)
+/*
+ * del_user_info - takes username and deletes that user from the user_info_list
+ */
+void del_user_info(char *username)
 {
-        user_list_t *p, *prev;
-	_log(LOG_DEBUG, "Deleting user <%s> ...", username);
-        for (p=head; p; prev=p, p=p->next) {
-                if (strncmp(p->user->username, username, strlen(username))) {
-                        _log(LOG_DEBUG, "User <%s> not matching, checking next ...\n", username);
-                        continue;
-                }
-                else {
-                        _log(LOG_DEBUG, "User <%s> found, deleting ...\n", username);
-                        if (p == head) {
-                                if (p->next) {
-                                        head = p->next;
-                                }
-                                else {
-                                        init_user_list();
-                                }
-                        }
-                        else {
-                                prev->next=p->next;
-                        }
-                        free(p->user);
-                        free(p);
-                        return SUCCESS_USER;
-                }
-        }
-        return ERR_USER_NOT_FOUND;
-}
-void del_user_list()
-{
-	user_list_t *i;
-	_log(LOG_DEBUG, "Deleting all users ...");
-	for (i=head;i;) {
-		head = i->next;
-                free(i->user);
-                free(i);
-                i=head;
+	user_info_t *pUser;
+
+	pUser = get_user_info(username);
+	if (pUser) {
+		HASH_DEL(user_info_list, pUser);
+        	free(pUser->auth_info->topic);
+        	free(pUser->auth_info->role);
+        	free(pUser->username);
+		free(pUser->auth_info);
+		free(pUser);
 	}
 }
-void print_user(user_info_t *p)
+/*
+ * del_user_list - deletes all the entries in the user_info_list
+ */
+void del_user_list()
 {
-	_log(LOG_DEBUG, "%s:%s:%s:%ld\n", p->username, p->topic, p->role, p->exp_time);
-}
-void print_user_list()
-{
-        user_list_t *i;
-        _log(LOG_DEBUG, "Printing users ...\n");
-        for (i=head;i;i=i->next) {
-                print_user(i->user);
-        }
+	user_info_t *pUser, *tmp;
+
+	HASH_ITER(hh, user_info_list, pUser, tmp) {
+		HASH_DEL(user_info_list, pUser);
+        	free(pUser->auth_info->topic);
+        	free(pUser->auth_info->role);
+        	free(pUser->username);
+		free(pUser->auth_info);
+		free(pUser);
+	}
 }
 /*
  * get the expiry time from JWT
@@ -624,47 +609,46 @@ jwt_t *get_jwt_token(char *respData)
 /*
  * Process the response received from keycloak
  */
-size_t process_auth_resp(void *respData, size_t size, size_t count, void *userData) 
+size_t processResp(void *respData, size_t size, size_t count, void *userData) 
 {
 
 	if ((count <= 0) || (!respData)) {
-		_log(LOG_NOTICE, "process_auth_resp: Received nothing from keycloak for user = %s\n", (char *)userData);
+		_log(LOG_NOTICE, "processResp: Received nothing from keycloak for user = %s\n", (char *)userData);
 		return BACKEND_ERROR;
 	}
-	_log(LOG_DEBUG, "process_auth_resp: Received response from keycloak: User = %s, Response = %s\n", (char *)userData, (char *)respData);
+	_log(LOG_DEBUG, "processResp: Received response from keycloak: User = %s, Response = %s\n", (char *)userData, (char *)respData);
 
 	jwt_t *jwtToken;
 	jwtToken = get_jwt_token(respData);
 	if (jwtToken == NULL) {
-		_log(LOG_NOTICE, "process_auth_resp:user=<%s>, Auth Failure, JWT decode error\n", (char *)userData);
+		_log(LOG_NOTICE, "processResp:user=<%s>, Auth Failure, JWT decode error\n", (char *)userData);
 		return BACKEND_ERROR;
 	}
-	user_info_t userinfo;
+	char role[50], topic[50];
 	int ret;
-	ret = get_jwt_topic(jwtToken, userinfo.topic);
+	ret = get_jwt_topic(jwtToken, topic);
 	if (ret < 0) {
-		_log(LOG_NOTICE, "process_auth_resp:user=<%s>, Auth Failure, no topic in JWT\n", (char *)userData);
+		_log(LOG_NOTICE, "processResp:user=<%s>, Auth Failure, no topic in JWT\n", (char *)userData);
 		return BACKEND_ERROR;
 	}
-	ret = get_jwt_exp_time(jwtToken, &(userinfo.exp_time));
+	long exp_time=0;
+	ret = get_jwt_exp_time(jwtToken, &exp_time);
 	if (ret < 0) {
-		_log(LOG_NOTICE, "process_auth_resp:user=<%s>, no expiry time in JWT\n", (char *)userData);
+		_log(LOG_NOTICE, "processResp:user=<%s>, no expiry time in JWT\n", (char *)userData);
 	}
-	ret = get_jwt_role(jwtToken, userinfo.role);
+	ret = get_jwt_role(jwtToken, role);
 	if (ret < 0) {
-		_log(LOG_NOTICE, "process_auth_resp:user=<%s>, Auth Failure, no role in JWT\n", (char *)userData);
+		_log(LOG_NOTICE, "processResp:user=<%s>, Auth Failure, no role in JWT\n", (char *)userData);
 		return BACKEND_ERROR;
 	}
-	_log(LOG_DEBUG, "process_auth_resp: Allowed topic=%s, Allowed Role=%s, exp_time=%ld\n", userinfo.topic, userinfo.role, userinfo.exp_time);
-	sprintf(userinfo.username, "%s", (char *)userData);
-	add_user_info(&userinfo);
-	print_user_list();
+	_log(LOG_DEBUG, "Allowed topic=%s, Allowed Role=%s, exp_time=%ld\n", topic, role, exp_time);
+	add_user_info((char *)userData, topic, role, exp_time);
 	return BACKEND_DEFER;
 }
 /*
  * Send authentication request to keycloak
  */
-static int http_post(void *handle, char *uri, const char *username, const char *password, const char *topic, int acc, int method)
+static int my_http_post(void *handle, char *uri, const char *username, const char *password, const char *topic, int acc, int method)
 {
 	struct jwt_backend *conf = (struct jwt_backend *)handle;
 	CURL *curl;
@@ -741,8 +725,7 @@ static int http_post(void *handle, char *uri, const char *username, const char *
 	//---- over ----
 
 	//data = (char *)malloc(strlen(string_envs) + strlen(escaped_username) + strlen(escaped_password) + strlen(escaped_topic) + strlen(string_acc) + strlen(escaped_clientid) + 50);
-	int data_bytes = strlen(string_envs)+strlen(escaped_username)+strlen(escaped_password)+strlen(escaped_topic)+strlen(string_acc)+50;
-	data = (char *)malloc(data_bytes);
+	data = (char *)malloc(strlen(string_envs) + strlen(escaped_username) + strlen(escaped_password) + strlen(escaped_topic) + strlen(string_acc) + 50);
 	if (data == NULL)
 	{
 		_fatal("ENOMEM");
@@ -755,7 +738,6 @@ static int http_post(void *handle, char *uri, const char *username, const char *
 	//		escaped_topic,
 	//		string_acc,
 	//		clientid);
-	memset(data, 0, data_bytes);
 	sprintf(data, "%susername=%s&password=%s",
 			string_envs,
 			escaped_username,
@@ -771,9 +753,7 @@ static int http_post(void *handle, char *uri, const char *username, const char *
 	curl_easy_setopt(curl, CURLOPT_PASSWORD, password);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, username);
-	if (strcmp(conf->with_tls, "true") == 0)
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, process_auth_resp);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, processResp);
 	re = curl_easy_perform(curl);
 	if (re == CURLE_OK)
 	{
